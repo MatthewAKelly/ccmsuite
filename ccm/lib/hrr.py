@@ -47,6 +47,17 @@ class HRR:
     def convolve(self,other):
         x=ifft(fft(self.v)*fft(other.v)).real
         return HRR(data=x)
+        
+    def permute(self,permutation):
+        # create a vector of zeroes
+        permutedVector = numpy.zeros(len(self.v))
+        
+        # copy elements from self.v into permutedVector
+        # according to permutation specified by permutation
+        for index, value in numpy.ndenumerate(self.v):
+            permutedVector[permutation[index]] = value
+        return HRR(data=permutedVector)
+        
     def __rmul__(self,other):
         if isinstance(other,HRR):
             x=ifft(fft(self.v)*fft(other.v)).real
