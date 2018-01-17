@@ -17,36 +17,35 @@
 #       Defaults to a generous 512 dimensions. 
 #       As few as 64 and as many as 2048 have been used in the literature 
 #       depending on the amount of noise or clarity desired.
-#   max_gram_size is the largest n-gram size that the model uses
-#       Defaults to a generous 7-grams
-#       Chunks stored in memory are stored as associations 
-#       between up to max_gram_size slot-values   
 #   verbose defaults to False
 #       set to True if you want to see what HDM is doing in detail
 # HDM also has some parameters that DM has and that are still important:   
 #   buffer is the buffer used to output chunks retrieved from HDM
-#   latency is F in Fe^-a, where a is the activation calculated as vector cosine
-#   threshold is the minimum cosine, less than threshold and a retrieval failure occurs
-#   threshold defaults to 0.1 as a cosine of around zero means the data in HDM is totally irrelevant
+#   latency is F in Fe^-a, where a is the activation calculated as 
+#   a = ln(cosine^2 / (1 - cosine^2))
 #
 # HDM has three important functions to call:
 # add(chunk): adds a chunk to memory
 # request(chunk): 
-#       Given a chunk with exactly one unknown value '?', 
+#       1. Given a chunk with exactly one unknown value '?', 
 #       request finds the best value to fill '?'
 #       which it returns
 #       Reaction time is a function of cosine (similarity of chunk to memory)
-# resonance(chunk):
-#       Given a chunk with no unknown values,
+#
+#       2. Given a chunk with no unknown values,
 #       resonance will return the chunk if it is familiar 
 #       or fail to return the chunk if it is unfamiliar
 #       i.e., has a cosine less than threshold
 #       Reaction time is a function of cosine (similarity of chunk to memory)
+# get_activation(chunk):
+#       Computes the coherence of a chunk, which used in request type 2.
+#       Returns a mean cosine.
 
 from __future__ import generators
 import ccm
 import math
 import numpy
+import copy
 
 __all__=['HDM']
 
@@ -59,9 +58,10 @@ from ccm.lib.hrr import HRR
 class HDM(Memory):
   # buffer is the buffer that the retrieved chunk is placed in
   # N is the vector dimensionality
-  #     recommended dimensionality in the range of 512 to 2048, defaults to 1024
+  #     recommended dimensionality in the range of 512 to 2048, defaults to 512
   #     a smaller dimensionality than 512 can be used to introduce additional noise
-  # threshold is the lowest cosine similarity allowed for a response
+  # threshold is the lowest log odds activation allowed for a response
+  #     this value is converted to a cosine similarity
   #     if no memory vector has a similarity to the query greater than threshold, the retrieval fails
   # maximum time is the most time the memory system is allowed to take
   # latency is used to calculate reaction time
@@ -70,40 +70,58 @@ class HDM(Memory):
   #     Bigger latencies result in longer reaction times
   # verbose defaults to FALSE. 
   #     If TRUE, verbose turns on print statements giving details about what HDM is doing.
-  def __init__(self,buffer,latency=0.05,threshold=0.1,maximum_time=10.0,finst_size=4,finst_time=3.0, N=512, verbose=False, max_gram_size=7):
+  # forgetting controls the forgetting rate due to retroactive inhibition
+  #     range [0 to 1]
+  #     1 = no forgetting
+  #     0 = no remembering
+  #     When updating memory:
+  #     memory vector =  forgetting * memory vector + new information vector
+  # noise controls the amount of noise added to memory per time step
+  #     Gaussian noise is added to all memory vectors
+  #     whenever Request or Add is called
+  #     When adding noise:
+  #     memory vector = memory vector + noise * time since last update * noise vector
+  #     Noise ranges from [0 ... ]
+  #     where 0 is no noise
+  #     and more is more noise
+  
+  def __init__(self,buffer,latency=0.05,threshold=-4.6,maximum_time=10.0,finst_size=4,finst_time=3.0, N=512, verbose=False, forgetting=1.0, noise=0.0):
     Memory.__init__(self,buffer)
     self._buffer=buffer
     self.N = N
     self.verbose = verbose
-    self.environment={'?': HRR(N=self.N)}
-    self.placeholder = self.environment['?']
-    self.cLambda = max_gram_size
-    self.memory={}
-    self.memStr={}
+    self.env={'?': HRR(N=self.N)}
+    self.placeholder = self.env['?']
+    self.mem={}
     self.slots={')': numpy.random.permutation(self.N)}
     self.left=self.slots[')']
     self.error=False
     self.busy=False
     self.adaptors=[]
     self.latency=latency
-    self.threshold=threshold
+    self.threshold=self.logodds_to_cosine(threshold)
     self.maximum_time=maximum_time
     self.partials=[]
     self.finst=Finst(self,size=finst_size,time=finst_time)
-    self.record_all_chunks=False
     self._request_count=0
+    self.inhibited=[] # list of inhibited values
+    self.forgetting=forgetting
+    self.noise=noise
+    self.lastUpdate = 0.0
     
   def clear(self):
-    self.memory.clear()
+    self.mem.clear()
     
   def add(self,chunk,record=None,**keys):
     # if error flag is true, set to false for production system
     if self.error: self.error=False
-    
+    # add noise to memory
+    if (self.noise != 0):
+        self.addNoise()
     # convert chunk to string (if it isn't already a string)
     chunk = self.chunk2str(chunk)
     # assign any unassigned values in chunk
-    self.assignValues(chunk)
+    chunk = self.assignValues(chunk)
     # check if chunk has slots by checking for colons (which separate slots from values)
     if ':' in chunk:
         # call addWithSlots to add a chunk with slot:value pairs to memory
@@ -111,6 +129,16 @@ class HDM(Memory):
     else:
         # call addJustValues to add a chunk with values and no slots to memory
         self.addJustValues(chunk)
+
+
+  # function for adding noise over time to memory    
+  def addNoise(self):
+    # weight by time difference
+    diff = self.now() - self.lastUpdate
+    for value in self.mem.keys():
+        noiseVector = HRR(N=self.N)
+        self.mem[value] = self.mem[value] + (self.noise * diff * noiseVector)
+    self.lastUpdate = self.now()
         
 
   def addWithSlots(self,chunk):
@@ -118,153 +146,243 @@ class HDM(Memory):
     chunkList = self.chunk2list(chunk)
     # define random Gaussian vectors and random permutations for any undefined values and slots
     self.defineVectors(chunkList)
-    # get all combinations ranging from individual slot-value pairs to sets of self.cLambda size
-    ngrams = self.getOpenNGrams(chunkList,range(1,self.cLambda+1))
-    
     # update the memory vectors with the information from the chunk
-    for gram in ngrams:
-        for p in xrange(len(gram)):
-            for i in xrange(len(gram)):
-                (slot,value) = gram[i]
-                slotPerm = self.slots[slot]
-                if i == p:
-                    # replace with placeholder
-                    valVec = self.environment['?']
-                    slotvalStr = slot + '(?)'
-                else:
-                    if value.startswith('!'):
-                        valVec = -1 * self.environment[value[1:]]
-                    else:
-                        valVec = self.environment[value]     
-                    slotvalStr = slot + '('+value+')'
-                # permute the value's vector by the slot's permutation & store that
-                slotvalVec = valVec.permute(slotPerm)
-                
-                if i == 0:
-                    chunking = slotvalVec
-                    chunkStr = slotvalStr
-                else:
-                    chunking = chunking * slotvalVec
-                    chunkStr = chunkStr+'*'+slotvalStr   
-            # update memory
-            (slot,value) = gram[p]
-            if value.startswith('!'):
-                self.memory[value] = self.memory[value[1:]] - chunking
-            else: 
-                self.memory[value] = self.memory[value] + chunking
-                
-            try:
-                self.memStr[value] = self.memStr[value] +' + '+ chunkStr
-            except:
-                self.memStr[value] = chunkStr
+    for p in range(0,len(chunkList)):
+        # create a copy of chunkList
+        query = copy.deepcopy(chunkList)
+        # replace p's value with ? in query, but leave slot as is
+        query[p][1] = '?'
+        print chunkList[p][1]
+        print query
+        # compute chunk vector
+        chunkVector = self.getUOGwithSlots(query)
+        # update memory
+        self.updateMemory(chunkList[p][1],chunkVector)
 
-
-      
-      
+  # add a chunk to memory
+  # when the chunk is just a list of values
+  # without slots
   def addJustValues(self,chunk):
     # convert chunk to a list of values
     chunkList = chunk.split()
     # define random Gaussian vectors for any undefined values
     self.defineVectors(chunkList)
-    # get all combinations ranging from pairs of values to sets of self.cLambda size
-    ngrams = self.getOpenNGrams(chunkList,range(2,self.cLambda+1))
-    
     # update the memory vectors with the information from the chunk
-    for gram in ngrams:
-        for p in xrange(len(gram)):
-            for i in xrange(len(gram)):
-                value = gram[i]
-                if i == p:
-                    # replace with placeholder
-                    valVec = self.environment['?']
-                    valStr = '?'
-                else:
-                    if value.startswith('!'):
-                        valVec = -1 * self.environment[value[1:]]
-                    else:
-                        valVec = self.environment[value]     
-                    valStr = value
-                
-                if i == 0:
-                    chunking = valVec
-                    chunkStr = valStr
-                else:
-                    # permute the left operand of the convolution to make convolution asymmetric
-                    # for this purpose we use a special permutation that we're calling "left"
-                    chunking = chunking.permute(self.left) * valVec
-                    chunkStr = chunkStr+'*'+valStr   
-            # update memory
-            value = gram[p]
-            if value.startswith('!'):
-                self.memory[value] = self.memory[value[1:]] - chunking
-            else: 
-                self.memory[value] = self.memory[value] + chunking
-                
-            try:
-                self.memStr[value] = self.memStr[value] +' + '+ chunkStr
-            except:
-                self.memStr[value] = chunkStr
+    for p in range(0,len(chunkList)):
+        # create a copy of chunkList
+        query = copy.deepcopy(chunkList)
+        # replace p with ? in query
+        query[p] = '?'
+        # compute chunk vector
+        chunkVector = self.getUOG(query)
+        # update memory
+        self.updateMemory(chunkList[p],chunkVector)
 
 
-  def request(self,chunk):
+  # function for constructing a vector that represents chunkList
+  # where chunkList is a list of values without slots
+  # and p is the location of ? in chunkList
+  # returns chunk, an HRR representing all unconstrained open grams in chunkList
+  # that include the ? at p.
+  # When slots are not used, the permutation "left" is used to preserve order
+  def getUOG(self, chunkList):
+    numOfItems = len(chunkList)
+    chunk = HRR(data=numpy.zeros(self.N))
+    sum   = HRR(data=numpy.zeros(self.N))
+    p     = numOfItems # initially, this will be set to index of ? when ? is found
+    for i in range (0,numOfItems):
+        # get the vector for the value i
+        value = chunkList[i]
+        # set p as the location of the placeholder ?
+        if value == '?':
+            p = i
+        # if value starts with ! then negate the environment vector
+        if value.startswith('!'):
+            valVec = -1 * self.env[value[1:]]
+        # otherwise use the environment vector as is
+        else:
+            valVec = self.env[value]
+        # compute the chunk vector 
+        if i == 0:
+            sum = valVec
+        elif (i > 0) and (i < p):
+            leftOperand = chunk + sum
+            leftOperand = leftOperand.permute(self.left)
+            chunk       = chunk + leftOperand.convolve(valVec)
+            sum         = sum + valVec
+        elif i == p:  # force all skip grams to include item p
+            leftOperand = chunk + sum
+            leftOperand = leftOperand.permute(self.left)
+            chunk       = leftOperand.convolve(valVec)
+            sum         = valVec
+        else: # i > p, i > 0
+            leftOperand = chunk + sum
+            leftOperand = leftOperand.permute(self.left)
+            chunk       = chunk + leftOperand.convolve(valVec)
+    return chunk
+
+
+  # function for constructing a vector that represents chunkList
+  # where chunkList is a list of values WITH slots as permutations
+  # returns chunk, an HRR representing all unconstrained open grams in chunkList
+  # that include the ?
+  def getUOGwithSlots(self, chunkList):
+    numOfItems = len(chunkList)
+    chunk = HRR(data=numpy.zeros(self.N))
+    sum   = HRR(data=numpy.zeros(self.N))
+    #sumStr = ''
+    #chunkStr = ''
+    p     = numOfItems # initially, this will be set to index of ? when ? is found
+    for i in range (0,numOfItems):
+        # get the vector for the slot value pair at i
+        slotvalue = chunkList[i]
+        slot  = slotvalue[0]
+        value = slotvalue[1]
+        # set p as the location of the placeholder ?
+        if value == '?':
+            p = i
+        # if value starts with ! then negate the environment vector
+        if value.startswith('!'):
+            valVec = -1 * self.env[value[1:]]
+        # otherwise use the environment vector as is
+        else:
+            valVec = self.env[value]
+        # permute the environment vector by the slot
+        valVec = valVec.permute(self.slots[slot])
+        #slotvalueStr = slot+':'+value
+        # compute the chunk vector 
+        if i == 0:
+            sum = valVec
+            #sumStr = slotvalueStr
+        elif (i > 0) and (i < p):
+            leftOperand = chunk + sum
+            chunk       = chunk + leftOperand.convolve(valVec)
+            #chunkStr    = chunkStr + ' + ' + slotvalueStr + ' * (' +  chunkStr + ' + ' + sumStr + ')'
+            sum         = sum + valVec
+            #sumStr      = sumStr + ' + ' + slotvalueStr
+        elif i == p:  # force all skip grams to include item p
+            leftOperand = chunk + sum
+            chunk       = leftOperand.convolve(valVec)
+            #chunkStr    = slotvalueStr + ' * (' +  chunkStr + ' + ' + sumStr + ')'
+            sum         = valVec
+            #sumStr      = slotvalueStr
+        else: # i > p, i > 0
+            leftOperand = chunk + sum
+            chunk       = chunk + leftOperand.convolve(valVec)
+            #chunkStr    = chunkStr + ' + ' + slotvalueStr + ' * (' +  chunkStr + ' + ' + sumStr + ')'
+    return chunk #, chunkStr
+
+
+  # for updating a memory vector for value with chunk
+  def updateMemory(self,value,chunking):
+    if value.startswith('!'):
+        if value[1:] not in self.mem:
+            self.mem[value[1:]] = -1*chunking
+        else:
+            self.mem[value[1:]] = self.forgetting * self.mem[value[1:]] - chunking
+    else:
+        if value not in self.mem:
+            self.mem[value] = chunking
+        else:
+            self.mem[value] = self.forgetting * self.mem[value] + chunking
+
+
+  # default request function, call this
+  def request(self,chunk,require_new=False):
      self.busy=True
      if self.error: self.error=False
      self._request_count+=1
 
      
+     # add noise to memory
+     if (self.noise != 0):
+        self.addNoise()
+
+     # clear list of inhibited values from previous queries
+     self.inhibited = []
      # convert chunk to string (if it isn't already a string)
      chunk = self.chunk2str(chunk)
-     # assign any unassigned values in chunk string
+     # assign any unassigned values in chunk string and load inhibited values into self.inhibited
      chunk = self.assignValues(chunk)
-     
+     if '?' in chunk:
+        self.requestValue(chunk,require_new)
+     else:
+        self.resonance(chunk)
+
+
+  def requestValue(self,chunk,require_new=False):
      # check if chunk has slots by checking for colons (which separate slots from values)
      if ':' in chunk:
-        queryVec, queryStr = self.queryWithSlots(chunk)
+        queryVec = self.queryWithSlots(chunk)
      else:
-        queryVec, queryStr = self.queryJustValues(chunk)
+        queryVec = self.queryJustValues(chunk)
      
-     if self.verbose:
-        print 'The query is ' + queryStr
      highestCosine = self.threshold
      bestMatch = 'none'
-     # find the best match to the query vector in memory
-     for mem,memVec in self.memory.items():
-        thisCosine = memVec.compare(queryVec)
-        if self.verbose:
-            print mem, thisCosine
-        if thisCosine > highestCosine:
-            highestCosine = thisCosine 
-            bestMatch = mem
      if self.verbose:
-        print bestMatch
+        print 'Query is: ' + chunk
+        print 'inhibited values: ' + str(self.inhibited)
+        print 'Finst contains: ' + str(self.finst.obj)
+     # find the best match to the query vector in memory
+     for mem,memVec in self.mem.items():
+        # skip inhibited values
+        if mem not in self.inhibited:
+            # skip previously reported values if require_new is true
+            if (not require_new) or (not self.finst.contains(mem)):
+                thisCosine = memVec.compare(queryVec)
+                if self.verbose:
+                    print mem, thisCosine
+                if thisCosine > highestCosine:
+                    highestCosine = thisCosine 
+                    bestMatch = mem
 
      if bestMatch == 'none':
+        if self.verbose:
+            print 'No matches found above threshold of cosine =', self.threshold
         self.fail(self._request_count)
      else:
          # replace the placeholder '?' with the retrieved memory 'bestMatch'
          chunk = chunk.replace('?',bestMatch)
          if self.verbose:
-            print 'Best match is ' + bestMatch + ' = ' + self.memStr[bestMatch]
+            print 'Best match is ' + bestMatch
+            print 'with a cosine of ' + str(highestCosine)
             print 'output chunk = ' + chunk
          chunkObj = Chunk(chunk)
          chunkObj.activation = highestCosine
+         self.finst.add(bestMatch)
          self.recall(chunkObj,matches=[],request_number=self._request_count)
   
   # performs multiple queries to determine the "coherence" of the chunk
   def resonance(self,chunk):
-     self.busy=True
-     if self.error: self.error=False
-     self._request_count+=1
-
-
-     # convert chunk to string (if it isn't already a string)
-     chunk = self.chunk2str(chunk)
-     # assign any unassigned values in chunk string
-     chunk = self.assignValues(chunk)
-
      if '?' in chunk:
-        raise Exception("Use the resonanuce function when the chunk has no '?'. If there is a '?' use request instead")
+        print 'chunk is ' + chunk
+        raise Exception("Use the resonance function when the chunk has no '?'. If there is a '?' use request instead")
           
+     coherence = self.get_activation(chunk)
+     if self.verbose:
+        print 'The coherence is ' + str(coherence)
+     if coherence <= self.threshold:
+        self.fail(self._request_count)
+     else:
+         chunkObj = Chunk(chunk)
+         chunkObj.activation = coherence
+         self.recall(chunkObj,matches=[],request_number=self._request_count)     
+
+  # compute the coherence / activation of a chunk
+  # called by resonance
+  # called by request when no ? values are present
+  # if logodds=True, the convert from mean cosine to logodds and return logodds
+  def get_activation(self,chunk,logodds=False):
+     # if this function has been called directly, we need to convert
+     if not self.busy:
+        # convert chunk to string (if it isn't already a string)
+        chunk = self.chunk2str(chunk)
+        # assign any unassigned values in chunk string and load inhibited values into self.inhibited
+        chunk = self.assignValues(chunk)
+        # add noise to memory
+        if (self.noise != 0):
+            self.addNoise()
+
      # keep track of the number of occurrences of a particular value in case of repeats
      occurrences = {}
      # keep a running sum of the cosines and a count of the values in the chunk
@@ -280,30 +398,23 @@ class HDM(Memory):
             slot,value = slotvalue.split(':')
             query.insert(numOfValues, slot+':?') # replace value with ?
             query = ' '.join(query) # convert query to a string
-            queryVec, queryStr = self.queryWithSlots(query)
+            queryVec = self.queryWithSlots(query)
         else:
             value = slotvalue
             query.insert(numOfValues, '?') # replace value with ?
             query = ' '.join(query) # convert query to a string
-            queryVec, queryStr = self.queryJustValues(query)
+            queryVec = self.queryJustValues(query)
         numOfValues = numOfValues + 1;
 
         # find the match between the query vector and the value's memory vector
-        match = self.memory[value].compare(queryVec)
+        self.defineVectors([value])
+        match = self.mem[value].compare(queryVec)
         sumOfCosines = sumOfCosines + match
-        if self.verbose:
-            print 'The query is ' + queryStr
-            print 'Match is ' + str(match) + ' for ' + value + ' = ' + self.memStr[value]
      coherence = sumOfCosines / numOfValues
-     if self.verbose:
-        print 'The coherence is ' + str(coherence)
-     if coherence <= self.threshold:
-        self.fail(self._request_count)
+     if logodds:
+        return self.cosine_to_logodds(coherence)
      else:
-         chunkObj = Chunk(chunk)
-         chunkObj.activation = coherence
-         self.recall(chunkObj,matches=[],request_number=self._request_count)     
-
+        return coherence
 
   # create a query vector for a chunk consisting of slot:value pairs
   # the query vector consists of the open n-grams of the slot:value pairs
@@ -314,53 +425,9 @@ class HDM(Memory):
      chunkList = self.chunk2list(chunk)
      # define random Gaussian vectors and random permutations for any undefined values and slots
      self.defineVectors(chunkList)
-     # get all combinations ranging from individual slot-value pairs to sets of self.cLambda size
-     ngrams = self.getOpenNGrams(chunkList,range(1,self.cLambda+1))
-
-     # filter out ngrams that don't contain a ?
-     queryGrams = []
-     for gram in ngrams:
-        there_is_one_placeholder  = False
-        for [slot,value] in gram:
-            if value is '?':
-                if there_is_one_placeholder:
-                    there_is_one_placeholder = False
-                    raise Exception('HDM requests must have no more than one ?')
-                else:
-                    there_is_one_placeholder = True
-                
-        if there_is_one_placeholder:
-            queryGrams.append(gram)
-     if not queryGrams:
-        raise Exception('HDM requests must have at least one value that is ?')
-     else:
-         # construct the query vector as a sum of queryGrams vectors
-         # where each queryGram vector is constructed by binding slotvalue vectors
-         # where each slotvalue vector is a slot permutation of a value vector
-         for j,gram in enumerate(queryGrams):
-            for i, slotvalue in enumerate(gram):
-                [slot,value] = slotvalue
-                slotPerm = self.slots[slot]
-                if value.startswith('!'):
-                    valVec = -1 * self.environment[value[1:]]
-                else:
-                    valVec = self.environment[value]     
-                # permute the value's vector by the slot's permutation
-                slotvalVec = valVec.permute(slotPerm)
-                if i == 0:
-                    # base case
-                    chunkStr = slot+'('+value+')'
-                    chunking = slotvalVec
-                else:
-                    chunkStr = chunkStr+'*'+slot+'('+value+')'
-                    chunking = chunking * slotvalVec
-            if j == 0:
-                queryStr = chunkStr
-                queryVec = chunking
-            else:
-                queryStr = queryStr+' + '+chunkStr
-                queryVec = queryVec + chunking
-     return queryVec, queryStr 
+     # construct the query vector
+     queryVec = self.getUOGwithSlots(chunkList)
+     return queryVec
     
   # create a query vector for a chunk consisting of slot:value pairs
   # the query vector consists of the open n-grams of the values
@@ -371,52 +438,9 @@ class HDM(Memory):
      chunkList = chunk.split()
      # define random Gaussian vectors for any undefined values
      self.defineVectors(chunkList)
-     # get all combinations ranging from pairs of slot-value pairs to sets of self.cLambda size
-     ngrams = self.getOpenNGrams(chunkList,range(2,self.cLambda+1))
-
-     # filter out ngrams that don't contain a ?
-     queryGrams = []
-     for gram in ngrams:
-        there_is_one_placeholder  = False
-        for value in gram:
-            if value is '?':
-                if there_is_one_placeholder:
-                    there_is_one_placeholder = False
-                    raise Exception('HDM requests must have no more than one ?')
-                else:
-                    there_is_one_placeholder = True
-                
-        if there_is_one_placeholder:
-            queryGrams.append(gram)
-            
-     if not queryGrams:
-        raise Exception('HDM requests must have at least one ?')
-     else:
-         # construct the query vector as a sum of queryGrams vectors
-         # where each queryGram vector is constructed by binding value vectors
-         # we make binding non-commutative by permuting the left operand using the "left" permutation
-         for j,gram in enumerate(queryGrams):
-            for i, value in enumerate(gram):
-                if value.startswith('!'):
-                    valVec = -1 * self.environment[value[1:]]
-                else:
-                    valVec = self.environment[value]     
-                if i == 0:
-                    # base case
-                    chunkStr = value
-                    chunking = valVec
-                else:
-                    chunkStr = chunkStr+'*'+value
-                    chunking = chunking.permute(self.left) * valVec
-            if j == 0:
-                queryStr = chunkStr
-                queryVec = chunking
-            else:
-                queryStr = queryStr+' + '+chunkStr
-                queryVec = queryVec + chunking
-     return queryVec, queryStr 
-                
-
+     # get all combinations ranging from pairs of slot-value pairs to sets
+     queryVec = self.getUOG(chunkList)
+     return queryVec
 
   # chunk2str converts a chunk into a string
   # or if it is already a string, chunk2str just returns the string unmodified
@@ -459,21 +483,75 @@ class HDM(Memory):
         else:
             value = attribute
             slot  = '' 
+        # sometimes we want to specify things not to select
+        # for example, condiment:?unknown!mustard
+        # means find a condiment that isn't mustard
         if value.startswith('?') and value is not '?':
-            try:
-                # take "?value" without the "?"
-                key = value[1:]
-                # look it up in the "bound dictionary" and substitute
-                value = bound[key]
-            # if "value" in "?value" is undefined, replace with "?"
-            except:
-                value = '?'
+            first = True
+            for subvalue in value.split('!'):
+                # we know the first value starts with ?, so let's substitute
+                if first:
+                    first = False;
+                    #check to see if it's not just a ? by itself
+                    if subvalue is '?':
+                        value = '?'
+                    else:
+                        try:
+                            # take "?value" without the "?"
+                            key = subvalue[1:]
+                            # look it up in the "bound dictionary" and substitute
+                            value = bound[key]
+                        # if "value" in "?value" is undefined, replace with "?"
+                        except:
+                            value = '?'
+                # the following values all start with ! meaning things we don't want to retrieve
+                else:
+                    if subvalue.startswith('?'):
+                        # but some of them may start with ? indicating we need to substitute
+                        try:
+                            # take "?value" without the "?"
+                            key = subvalue[1:]
+                            # look it up in the "bound dictionary" and add to inhibited values list
+                            subvalue = bound[key]
+                        # if "value" in "?value" is undefined, raise exception
+                        except:
+                            print chunk
+                            print 'Error with subvalue: ' + subvalue + ' in chunk: ' + chunk
+                            raise Exception('Values beginning with ! are understood in this context as indicating values to be inhibited. The specified !value is undefined')
+                    # add subvalue to inhibition list
+                    self.inhibited.append(subvalue)
+
         # add the value to the chunkList
         chunkList.append(slot+value)
     # convert chunkList into a string delimited by spaces
     return ' '.join(chunkList)
   
+  
+  #get environment vector for a given value
+  def get(self,value):
+    if value not in self.env:
+        self.env[value] = HRR(N=self.N)
+        self.mem[value] = HRR(data=numpy.zeros(self.N))
+    return self.env[value].copy()
+  
+  
+  #set environment vector for a given value to a specified vector
+  def set(self,value,vector):
+    try: # assume vector is an HRR object
+        newVec = vector.copy()
+        newVec.normalize()
+        self.env[value] = newVec
+    except: # assume vector is a list of numbers
+        vector = [float(i) for i in vector]
+        self.env[value] = HRR(data=vector)
+        self.env[value].normalize()
+    # check to see if it's in memory already, if not, define its memory as a vector of zeros
+    if value not in self.mem:
+        self.mem[value] = HRR(data=numpy.zeros(self.N))
+
+
   # generate Gaussian vectors and random permutations for values & slots without
+  # chunkList is a list of attributes, each attribute is a string
   def defineVectors(self,chunkList):
     for attribute in chunkList:
         # check to see if there is a slot, or if it's just a value without a slot
@@ -488,41 +566,17 @@ class HDM(Memory):
         if value.startswith('!'):
             value = value[1:]
         # if it's a new value, create a new random vector
-        if value not in self.environment.keys():
-            self.environment[value] = HRR(N=self.N)
-            self.memory[value] = HRR(data=numpy.zeros(self.N))#self.environment[value]
-
+        if value not in self.env:
+            self.env[value] = HRR(N=self.N)
+            self.mem[value] = HRR(data=numpy.zeros(self.N))#self.env[value]
   
-
-  def getOpenNGrams(self, seg, scale, spaces=None):
-    '''
-    Returns a list of the open n-grams of the string "seg", with sizes specified
-    by "scale", which should be a list of positive integers in ascending order.
-    "Spaces" indicates whether a space character should be used to mark gaps in
-    non-contiguous n-grams.
-    '''
-    ngrams = []
-    
-    for size in scale:
-        if size > len(seg): break
-    
-        for i in xrange(len(seg)):
-            if i+size > len(seg): break
-            ngrams.append(seg[i:i+size])
-            if i+size == len(seg): continue
-            for b in xrange(1, size):
-                for e in xrange(1, len(seg)-i-size+1):
-                    if spaces is None:
-                        ngrams.append(seg[i:i+b] + seg[i+b+e:i+e+size])
-                    else:
-                        ngrams.append(seg[i:i+b] + [spaces] + seg[i+b+e:i+e+size])
-    return ngrams
-     
+       
   def fail(self,request_number):
      if self.threshold is None: 
          time=self.maximum_time
      else:
-         time=self.latency*math.exp(-self.threshold)
+         logodds = self.cosine_to_logodds(self.threshold)
+         time=self.latency*math.exp(-logodds)
          if time>self.maximum_time: time=self.maximum_time 
      yield time
      if request_number!=self._request_count: return
@@ -532,8 +586,8 @@ class HDM(Memory):
      self.busy=False
   
   def recall(self,chunk,matches,request_number):
-     self.finst.add(chunk)
-     time=self.latency*math.exp(-chunk.activation)
+     logodds = self.cosine_to_logodds(chunk.activation)
+     time=self.latency*math.exp(-logodds)
      if time>self.maximum_time: time=self.maximum_time
      yield time
      if request_number!=self._request_count: return
@@ -541,7 +595,17 @@ class HDM(Memory):
      for a in self.adaptors: a.recalled(chunk)
      self.busy=False
      
-  
+# Converts vector cosine (which approximates root probability)
+# to a log odds ratio (which is what ACT-R activation estimates) 
+  def cosine_to_logodds(self,cosine):
+        if cosine > 0.999:
+            cosine = 0.999
+        return math.log(cosine**2 / (1 - cosine**2))
+
+# Converts log odds ratio or ACT-R activation
+# to a root probability (which the cosine approximates)
+  def logodds_to_cosine(self,logodds):
+        return math.sqrt(numpy.exp(logodds) / (numpy.exp(logodds) + 1))
 
 class Finst:
   def __init__(self,parent,size=4,time=3.0):
